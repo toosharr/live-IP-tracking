@@ -1,63 +1,169 @@
+################################################################# FULL PROJECT ###########################################################
+
 import subprocess
 import pandas as pd
+from datetime import datetime, timedelta
+import socket
+import pyodbc
 import time
-import os
-from datetime import datetime
-import win32com.client
 
-# === CONFIGURATION ===
-IP_LIST = ['192.168.0.1', '192.168.0.2']
-EXCEL_FILE = 'ip_status_log.xlsx'
-CHECK_INTERVAL = 10  # seconds
+# Database connection
+conn = pyodbc.connect(
+    'DRIVER={ODBC Driver 17 for SQL Server};'
+    'SERVER=##;'
+    'DATABASE=##;'
+    'UID=##;'
+    'PWD=#####;'
+)
+cursor = conn.cursor()
 
-# === Function to ping an IP ===
-def is_ip_alive(ip):
-    try:
-        output = subprocess.check_output(['ping', '-n', '1', ip], universal_newlines=True)
-        return "TTL=" in output
-    except subprocess.CalledProcessError:
-        return False
+# Get list of IPs to ping
+ip_df = pd.read_sql("SELECT ip_address FROM ip", conn)
+ping_list = ip_df['ip_address'].tolist()
 
-# === Function to send email if IP is down ===
-def send_email(ip):
-    outlook = win32com.client.Dispatch("Outlook.Application")
-    mail = outlook.CreateItem(0)
-    mail.To = "infrateam@example.com"
-    mail.Subject = f"[ALERT] IP Down - {ip}"
-    mail.Body = f"The IP address {ip} is DOWN as of {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
-    mail.Send()
+# Ensure columns exist for all IPs in PingResponseMatrix table
+def ensure_ip_columns_exist(ip_list):
+    cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='PingResponse'")
+    existing_columns = {row[0] for row in cursor.fetchall()}
+    for ip in ip_list:
+        if ip not in existing_columns:
+            cursor.execute(f"ALTER TABLE PingResponse ADD [{ip}] VARCHAR(50)")
+    conn.commit()
 
-# === Function to update Excel ===
-def update_excel(data):
-    df_new = pd.DataFrame(data, columns=['Timestamp', 'IP Address', 'Status'])
+ensure_ip_columns_exist(ping_list)
 
-    if os.path.exists(EXCEL_FILE):
-        df_existing = pd.read_excel(EXCEL_FILE)
-        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+# Get previous logs
+query_for_ip_status = "SELECT * FROM ip_ping_Status"
+ip_data_excel = pd.read_sql(query_for_ip_status, conn)
+
+new_records = []
+data_matrix = []
+running_time = 60  # seconds
+interval = 1  # seconds
+start_time = time.time()
+
+while time.time() - start_time < running_time:
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    row_matrix = {"Timestamp": timestamp}
+    for ip in ping_list:
+        status = "Up" if subprocess.run(f"ping -n 1 {ip}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.find("Reply from") != -1 else "Down"
+        response_time = "Timeout"
+        try:
+            output = subprocess.check_output(f'ping -n 1 {ip}', shell=True, text=True)
+            for line in output.split("\n"):
+                if "time=" in line:
+                    response_time = line.split("time=")[-1].split("ms")[0].strip() + "ms"
+                    break
+        except subprocess.CalledProcessError:
+            pass
+
+        downtime = "0:00:00"
+        if status == "Down" and not ip_data_excel.empty:
+            past_up_records = ip_data_excel[(ip_data_excel["IP"] == ip) & (ip_data_excel["Status"] == "Up")]
+            if not past_up_records.empty:
+                last_up_date = past_up_records.iloc[-1]["Date"]
+                last_up_time = datetime.strptime(str(past_up_records.iloc[-1]["Start_time"]), "%H:%M:%S").time()
+                last_up_datetime = datetime.combine(last_up_date, last_up_time)
+                downtime_duration = now - last_up_datetime
+            else:
+                past_down_records = ip_data_excel[(ip_data_excel["IP"] == ip) & (ip_data_excel["Status"] == "Down")]
+                if not past_down_records.empty:
+                    first_down_date = past_down_records.iloc[0]["Date"]
+                    first_down_time = datetime.strptime(str(past_down_records.iloc[0]["Start_time"]), "%H:%M:%S").time()
+                    first_down_datetime = datetime.combine(first_down_date, first_down_time)
+                    downtime_duration = now - first_down_datetime
+                else:
+                    downtime_duration = None
+
+            if downtime_duration:
+                days = downtime_duration.days
+                hours, remainder = divmod(downtime_duration.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                downtime = f"{days} days {hours:02}:{minutes:02}:{seconds:02}"
+
+        local_ip = socket.gethostbyname(socket.gethostname())
+        new_records.append({
+            "IP": ip,
+            "Date": now.date(),
+            "Start_time": now.time().replace(microsecond=0),
+            "Status": status,
+            "Downtime": downtime,
+            "IP_fetched_by": local_ip
+        })
+        row_matrix[ip] = response_time
+
+    data_matrix.append(row_matrix)
+    time.sleep(interval)
+
+# Update ip_ping_status table
+df_to_insert = pd.DataFrame(new_records).rename(columns={
+    'IP': 'ip',
+    'Date': 'date',
+    'Start_time': 'start_time',
+    'Status': 'status',
+    'Downtime': 'downtime',
+    'IP_fetched_by': 'ip_fetched_by'
+})
+
+def insert_ip_data(df):
+    for _, row in df.iterrows():
+        cursor.execute("""
+            INSERT INTO ip_ping_status (ip, date, start_time, status, downtime, ip_fetched_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, row['ip'], row['date'], row['start_time'], row['status'], str(row['downtime']), row['ip_fetched_by'])
+    conn.commit()
+
+insert_ip_data(df_to_insert)
+
+# Update live_ping_status
+ip_data_excel = pd.concat([ip_data_excel, pd.DataFrame(new_records)], ignore_index=True)
+latest_record = []
+
+for ip in ping_list:
+    condition = (ip_data_excel["IP"] == ip) & (ip_data_excel["Date"] == datetime.now().date()) & (ip_data_excel["Status"] == "Down")
+    if ip not in ip_data_excel.columns:
+        ip_data_excel[ip] = 0
     else:
-        df_combined = df_new
+        ip_data_excel[ip] = ip_data_excel[ip].fillna(0)
 
-    df_combined.to_excel(EXCEL_FILE, index=False)
+    ip_data_excel.loc[condition, ip] = 1
+    ip_data_excel[f"Cumulative_{ip}"] = ip_data_excel[ip].cumsum()
 
-# === MAIN LOOP ===
-print("Starting IP monitor... Press Ctrl+C to stop.")
+    ip_filtered = ip_data_excel[ip_data_excel["IP"] == ip]
+    if not ip_filtered.empty:
+        latest_ip_row_copy = ip_filtered.iloc[-1].copy()
+        latest_record.append(latest_ip_row_copy)
 
-try:
-    while True:
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        records = []
+live_ping_status = pd.DataFrame(latest_record).fillna(0)
+live_ping_status["Downtime_Counter"] = ""
+for ip in ping_list:
+    live_ping_status.loc[live_ping_status["IP"] == ip, "Downtime_Counter"] = live_ping_status[f"Cumulative_{ip}"]
+    live_ping_status.drop(columns=[ip, f"Cumulative_{ip}"], inplace=True)
 
-        for ip in IP_LIST:
-            status = "UP" if is_ip_alive(ip) else "DOWN"
-            print(f"{timestamp} | {ip} --> {status}")
+def update_live_ping_status(df):
+    cursor.execute("TRUNCATE TABLE live_ping_status")
+    for _, row in df.iterrows():
+        cursor.execute("""
+            INSERT INTO live_ping_status (ip, date, start_time, status, downtime, ip_fetched_by, downtime_counter)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, row['IP'], row['Date'], row['Start_time'], row['Status'], str(row['Downtime']), row['IP_fetched_by'], int(row['Downtime_Counter']))
+    conn.commit()
 
-            if status == "DOWN":
-                send_email(ip)
+update_live_ping_status(live_ping_status)
 
-            records.append([timestamp, ip, status])
+# Save matrix to PingResponseMatrix table
 
-        update_excel(records)
-        time.sleep(CHECK_INTERVAL)
+matrix_df = pd.DataFrame(data_matrix)
+cursor.execute("TRUNCATE TABLE PingResponse")
+for _, row in matrix_df.iterrows():
+    columns = ["Timestamp"] + [ip for ip in ping_list]
+    placeholders = ["?"] * len(columns)
+    values = [row[col] if col in row else "Timeout" for col in columns]
+    insert_query = f"INSERT INTO PingResponse ({', '.join(f'[{col}]' for col in columns)}) VALUES ({', '.join(placeholders)})"
+    cursor.execute(insert_query, values)
+conn.commit()
 
-except KeyboardInterrupt:
-    print("\nMonitoring stopped by user.")
+cursor.close()
+conn.close()
+print("DATABASE UPDATED SUCCESSFULLY")
